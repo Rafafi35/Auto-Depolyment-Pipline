@@ -1,0 +1,100 @@
+image: docker:23.0.4
+
+variables:
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_TLS_CERTDIR: ''
+
+  AWS_DEFAULT_REGION: '$AWS_DEFAULT_REGION'
+  CI_AWS_ECR_REGISTRY: '$CI_AWS_ECR_REGISTRY'
+  CI_AWS_ECR_REPOSITORY_NAME: '$CI_AWS_ECR_REPOSITORY_NAME'
+
+  AWS_ACCESS_KEY_ID: '$AWS_ACCESS_KEY_ID'
+  AWS_SECRET_ACCESS_KEY: '$AWS_SECRET_ACCESS_KEY'
+  AWS_SESSION_TOKEN: '$AWS_SESSION_TOKEN'
+
+  VPC_ID: '$VPC_ID'
+  SUBNET_ID_1: '$SUBNET_ID_1'
+  SUBNET_ID_2: '$SUBNET_ID_2'
+
+services:
+  - docker:23.0.4-dind
+
+stages:
+  - build
+  - deploy
+
+build:
+  stage: build
+  before_script:
+    - apk add --no-cache py3-pip
+    - pip install awscli
+    - aws --version
+    - >
+      aws ecr get-login-password --region "$AWS_DEFAULT_REGION" |
+      docker login --username AWS --password-stdin "$CI_AWS_ECR_REGISTRY"
+
+  script:
+    - docker build -t "$CI_AWS_ECR_REPOSITORY_NAME:latest" .
+    - docker tag "$CI_AWS_ECR_REPOSITORY_NAME:latest" "$CI_AWS_ECR_REGISTRY/$CI_AWS_ECR_REPOSITORY_NAME:latest"
+    - docker push "$CI_AWS_ECR_REGISTRY/$CI_AWS_ECR_REPOSITORY_NAME:latest"
+    
+
+deploy:
+  stage: deploy
+  image:
+    name: amazon/aws-cli:latest
+    entrypoint: [""] 
+  script:
+ 
+    - aws sts get-caller-identity
+    
+    - aws ecs create-cluster --cluster-name refcard03-cluster
+
+    - |
+      aws ecs register-task-definition --cli-input-json "{
+        \"family\": \"refcard03-taskdef\",
+        \"requiresCompatibilities\": [\"FARGATE\"],
+        \"networkMode\": \"awsvpc\",
+        \"cpu\": \"256\",
+        \"memory\": \"512\",
+        \"taskRoleArn\": \"LabRole\",
+        \"executionRoleArn\": \"LabRole\",
+        \"containerDefinitions\": [
+          {
+            \"name\": \"refcard-03\",
+            \"image\": \"${CI_AWS_ECR_REGISTRY}/${CI_AWS_ECR_REPOSITORY_NAME}\",
+            \"essential\": true,
+            \"portMappings\": [
+              {
+                \"containerPort\": 8080,
+                \"protocol\": \"tcp\"
+              }
+            ]
+          }
+        ]
+      }"
+
+    - |
+      SG_ID=$(aws ec2 create-security-group \
+        --group-name refcard-03 \
+        --description "Security group for refcard-03 container" \
+        --vpc-id $VPC_ID \
+        --query 'GroupId' --output text)
+
+      aws ec2 authorize-security-group-ingress \
+        --group-id "$SG_ID" \
+        --protocol tcp \
+        --port 8080 \
+        --cidr 0.0.0.0/0
+
+    - |
+      aws ecs create-service \
+        --cluster refcard03-cluster \
+        --service-name refcard03-service \
+        --task-definition refcard03-taskdef \
+        --launch-type FARGATE \
+        --desired-count 1 \
+        --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_ID_1,$SUBNET_ID_2],securityGroups=[$SG_ID],assignPublicIp=ENABLED}"
+
+  only:
+    - main
